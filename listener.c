@@ -28,6 +28,7 @@ void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort
 void DeleteListener(newsock *socklist, int *sockCnt);
 void* listenerThread(void* sock);
 void EditListener(newsock *socklist, int *sockCnt, int *capacity);
+void AccessListener(newsock *socklist, int *sockCnt);
 
 
 int main(void){
@@ -77,6 +78,7 @@ int main(void){
                 break;
             case 4:
                 // use a listener
+                AccessListener(socklist, &sockCnt);
                 break;
 
             case 5:
@@ -189,14 +191,22 @@ void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort
 
 void* listenerThread(void* sock) {
 
+    // pthread_mutexattr_t attr;
+    // pthread_mutexattr_init(&attr);
+    // pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_NONE); 
+
+
     newsock *listener = (newsock*)sock;
 
     ssize_t n = 0;
     int total_len = 0;
     while (1) {
+
+        socklen_t len = sizeof(listener->client);
+
         pthread_mutex_lock(&listener->lock);
 
-        if(listener->connectfd = accept(listener->sockfd, (struct sockaddr*)&listener->client, NULL) >= 0){
+        if((listener->connectfd = accept(listener->sockfd, (struct sockaddr*)&listener->client, &len)) >= 0){
 
             inet_ntop(AF_INET, &listener->client.sin_addr, listener->client_ip, sizeof(listener->client_ip));
             listener->clientPort = ntohs(listener->client.sin_port);
@@ -207,6 +217,7 @@ void* listenerThread(void* sock) {
         if(listener->connectfd < 0){
             perror("Server accept failed");
             pthread_mutex_unlock(&listener->lock);
+            sleep(1); // sleep for 1s before retrying
             continue;
         }
         
@@ -336,6 +347,7 @@ void AccessListener(newsock *socklist, int *sockCnt){
     printf("\nEnter index of listener you want to access\n");
     scanf("%d", &inp);
     getchar();
+    inp -= 1;
 
     if(inp < 0 || inp >= *sockCnt){
         printf("Invalid index. Returning to main menu.\n");
