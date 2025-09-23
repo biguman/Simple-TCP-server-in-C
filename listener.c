@@ -396,7 +396,7 @@ void AccessListener(newsock *socklist, int *sockCnt){
     return;
 }
 
-//  LEGACY IDEAS
+//  WHEN I WAS USING FORKS INSTEAD OF THREADS. INCOMPLETE FORK IMPLEMENTATION
 
 // void ListenFork(newsock *listener) {
 //     socklen_t len = sizeof(listener->client);
@@ -416,7 +416,7 @@ void AccessListener(newsock *socklist, int *sockCnt){
 // }
 
 
- //     LEGACY MAIN CODE
+ //     LEGACY MAIN CODE MADE TO HOLD ONLY ONE LISTENER
 
      // int sockfd, connectfd; 
     // struct sockaddr_in server, client; 
