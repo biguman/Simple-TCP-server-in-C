@@ -9,8 +9,8 @@
 #include <errno.h>
 #include <asm-generic/socket.h>
 #include <pthread.h>
+#include <arpa/inet.h>
 
-#define PORT 9001
 
 typedef struct{
     char name[16];
@@ -18,6 +18,9 @@ typedef struct{
     struct sockaddr_in server, client; // structs for server (to initialize socket) and client
     char client_ip[INET_ADDRSTRLEN];
     int clientPort;
+    pthread_mutex_t lock;
+    int buffer_size;
+    char *buffer;
 } newsock;
 
 void ListActiveListeners(newsock *socklist, int sockCnt);
@@ -78,7 +81,7 @@ int main(void){
 
             case 5:
                 //list listeners and take inp to delete which one
-                ListActiveListeners(socklist, sockCnt);
+                DeleteListener(socklist, &sockCnt);
 
                 break;
 
@@ -111,7 +114,12 @@ void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort
             exit(EXIT_FAILURE);
         }
     }
-
+    newSock.buffer_size = 1024;
+    newSock.buffer = malloc(newSock.buffer_size);
+        if (!newSock.buffer) {
+        perror("Failed to allocate memory for buffer");
+        exit(EXIT_FAILURE);
+    }
 
     printf("Enter name for new listener (max 15 characters): ");
     if(fgets(newSock.name, 15, stdin)){
@@ -126,23 +134,15 @@ void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort
 
     PORT_CHANGE:
     int port;
-    printf("Enter port number for new listener: ");
-    if (scanf("%d", &port) != 1 || port <= 0 || port > 65535) {
+    printf("\033[34mEnter port number for new listener: \033[0m");
+    if (scanf(" %d", &port) != 1 || port <= 0 || port > 65535) {
         getchar();
-        printf("Invalid port number. Please enter a valid port (1-65535).\n");
+        printf("Invalid port number. Please enter a valid port (1-65535).\nEntered %d\n", port);
         return;
     }
     getchar();
 
-    if(EditPort){
-        socklist[EditIndex].server.sin_port = htons(port);
-        socklist[EditIndex].sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (socklist[EditIndex].sockfd < 0) {
-            perror("Socket creation failed\n");
-            return;
-        }
-        return;
-    }
+
     newSock.sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (newSock.sockfd < 0) {
         perror("Socket creation failed\n");
@@ -172,58 +172,65 @@ void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort
         
     }
 
-    socklist[*sockCnt] = newSock;
-    (*sockCnt)++;
+    if(EditPort !=1){
+        socklist[*sockCnt] = newSock;
+        (*sockCnt)++;
+    }
+    else{
+        socklist[EditIndex] = newSock;
+    }
 
     pthread_t thread_id;
 
     pthread_create(&thread_id, NULL, listenerThread, &newSock);
-    printf("Listener %s created on port %d\n", newSock.name, port);
+    printf("\033[32mListener %s created on port \033[0m%d\n", newSock.name, port);
 }
 
 
 void* listenerThread(void* sock) {
-    int buffer_size = 1024;
-    char *buffer = malloc(buffer_size);
+
     newsock *listener = (newsock*)sock;
-    if (!buffer) {
-        perror("Failed to allocate memory for buffer");
-        exit(EXIT_FAILURE);
-    }
+
     ssize_t n = 0;
     int total_len = 0;
     while (1) {
+        pthread_mutex_lock(&listener->lock);
+
         if(listener->connectfd = accept(listener->sockfd, (struct sockaddr*)&listener->client, NULL) >= 0){
 
             inet_ntop(AF_INET, &listener->client.sin_addr, listener->client_ip, sizeof(listener->client_ip));
-            (*listener).clientPort = ntohs(listener->client.sin_port);
+            listener->clientPort = ntohs(listener->client.sin_port);
 
             printf("Accepted connection on listener %s\n", listener->name);
             printf("Client IP: %s, Client Port: %d\n", listener->client_ip, listener->clientPort);
         }
         if(listener->connectfd < 0){
             perror("Server accept failed");
+            pthread_mutex_unlock(&listener->lock);
             continue;
         }
         
 
-        n = read(listener->connectfd, buffer + total_len, buffer_size - total_len - 2);
+        n = read(listener->connectfd, listener->buffer + total_len, listener->buffer_size - total_len - 2);
         if(n > 0){
             total_len += n;
 
 
-            if(total_len >= buffer_size - 2) {
-                buffer = realloc(buffer, buffer_size * 2);
-                buffer_size *= 2;
-                if (!buffer) {
+            if(total_len >= listener->buffer_size - 2) {
+                listener->buffer = realloc(listener->buffer, listener->buffer_size * 2);
+                listener->buffer_size *= 2;
+                if (!listener->buffer) {
                     perror("Failed to allocate memory for buffer");
+                    pthread_mutex_unlock(&listener->lock);
                     exit(EXIT_FAILURE);
                 }
             }
-            printf("Received data: %s\n", buffer);
-            buffer[n] = '\n'; // new line
-            buffer[n + 1] = '\0'; // null terminator
+            printf("Received data: %s\n", listener->buffer);
+            listener->buffer[n] = '\n'; // new line
+            listener->buffer[n + 1] = '\0'; // null terminator
         }
+        pthread_mutex_unlock(&listener->lock);
+        sleep(1); // to let parent grab access to listener if needed
 
     }
     return NULL;
@@ -233,7 +240,7 @@ void ListActiveListeners(newsock *socklist, int sockCnt) {
     printf("Active listeners:\n\n");
     for (int i = 0; i < sockCnt; i++) {
         if (socklist[i].sockfd != -1) {
-            printf("%d: Listener %s: Socket FD = %d, Port = %d\n", sockCnt, socklist[i].name, socklist[i].sockfd, ntohs(socklist[i].server.sin_port));
+            printf("%d: Listener \"%s\": Socket FD = %d, Port = %d\n\n", i+1, socklist[i].name, socklist[i].sockfd, ntohs(socklist[i].server.sin_port));
         } else {
             printf("Listener %d: Inactive\n", i + 1);
         }
@@ -245,11 +252,12 @@ void DeleteListener(newsock *socklist, int *sockCnt) {
 
     ListActiveListeners(socklist, *sockCnt);
 
-    printf("Enter the index of the listener to delete (1 to %d): \n\n", *sockCnt);
+    printf("Enter the index of the listener to delete (1 to %d): ", *sockCnt);
 
 
     if (scanf("%d", &delIndex) != 1 || delIndex < 1 || delIndex > *sockCnt) {
-        printf("Invalid index. Please try again.\n");
+        getchar();
+        printf("Invalid index. Please try again.\n\n");
         return;
     }
     getchar(); // consume leftover newline
@@ -265,7 +273,7 @@ void DeleteListener(newsock *socklist, int *sockCnt) {
     }
     (*sockCnt)--;
 
-    printf("Listener deleted successfully.\n");
+    printf("\033[31mListener deleted successfully.\033[0m\n\n");
 }
 
 void EditListener(newsock *socklist, int *sockCnt, int *capacity){
@@ -273,15 +281,25 @@ void EditListener(newsock *socklist, int *sockCnt, int *capacity){
     int inp;
     ListActiveListeners(socklist, *sockCnt);
 
-    printf("Enter index of listener you want to edit\n");
+    printf("Enter number of listener you want to edit\n");
     scanf("%d", &inp);
     getchar();
+    if(inp < 1 || inp > *sockCnt){
+        printf("Invalid index. Returning to main menu.\n\n");
+        return;
+    }
+    else if( socklist[inp-1].sockfd == -1){
+        printf("Listener is inactive. Returning to main menu.\n\n");
+        return;
+    }
 
-    printf("Name: %s\nPort: %d", socklist[inp].name, socklist[inp].server.sin_port);
-    printf("What do you want to edit?\n1 for name\n2 for port (Editing port WILL close socket and open a new one)\n");
-    scanf("%d", &inp);
+    int choice;
+    printf("Name: %s\nPort: %d\n\n", socklist[inp-1].name, ntohs(socklist[inp-1].server.sin_port));
+    printf("What do you want to edit?\n1 for name\n2 for port (Editing port WILL close socket and open a new one)\n3 to exit\n");
+    scanf("%d", &choice);
     getchar();
-    switch(inp){
+    inp -= 1;
+    switch(choice){
         case 1:
             printf("Enter new name (max 15 characters): ");
             if(fgets(socklist[inp].name, 15, stdin)){
@@ -297,24 +315,73 @@ void EditListener(newsock *socklist, int *sockCnt, int *capacity){
             break;
 
         case 2:
-            int port;
             printf("Enter new port number: ");
-            CreateListener(socklist, sockCnt, &capacity, 1, inp); // Create new listener on new port
-            if (scanf("%d", &port) != 1 || port <= 0 || port > 65535) {
-                getchar();
-                printf("Invalid port number. Please enter a valid port (1-65535).\n");
-                return;
-            }
-            getchar();
-            socklist[inp].server.sin_port = htons(port);
+            CreateListener(socklist, sockCnt, capacity, 1, inp); // Create new listener on new port
             
-
-
             break;
+
+        case 3:
+            return;
+
         default:
             printf("Invalid option. Returning to main menu.\n");
             return;
     }
+}
+
+void AccessListener(newsock *socklist, int *sockCnt){
+    int inp;
+    ListActiveListeners(socklist, *sockCnt);
+
+    printf("\nEnter index of listener you want to access\n");
+    scanf("%d", &inp);
+    getchar();
+
+    if(inp < 0 || inp >= *sockCnt){
+        printf("Invalid index. Returning to main menu.\n");
+        return;
+    }
+    else if( socklist[inp].sockfd == -1){
+        printf("Listener is inactive. Returning to main menu.\n\n");
+        return;
+    }
+
+    // Now you can use socklist[inp] to access the selected listener
+    // For example, you might want to read messages from it or perform other operations
+    printf("Accessing listener %s on port %d\n", socklist[inp].name, ntohs(socklist[inp].server.sin_port));
+    pthread_mutex_lock(&socklist[inp].lock);
+    printf("Locked listener %s for exclusive access.\n", socklist[inp].name);
+
+    while(1) {
+        printf("Type: \n0 to return to main menu\n1 to see client info\n2 to read messages\n3 to send message(still not developed)\n");
+        scanf("%d", &inp);
+        getchar();
+
+        inp -= 1;
+
+        if(inp == -1){
+            pthread_mutex_unlock(&socklist[inp].lock);
+            break;
+        }
+        else if(inp == 0){
+            printf("Client IP: %s, Client connected to Port: %d\n\n", socklist[inp].client_ip, socklist[inp].clientPort);
+        }
+        else if(inp == 1){
+            printf("%s", socklist[inp].buffer); // read messages
+        }
+        else if(inp == 2){
+            // send message
+        }
+        else{
+            printf("Invalid option. Returning to main menu.\n");
+            pthread_mutex_unlock(&socklist[inp].lock);
+        
+        }
+    }
+
+
+    pthread_mutex_unlock(&socklist[inp].lock);
+    return;
 }
 
 //  LEGACY IDEAS
