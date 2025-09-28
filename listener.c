@@ -12,29 +12,39 @@
 #include <arpa/inet.h>
 
 
+
 typedef struct{
+
     char name[16];
     int sockfd, connectfd; // file descriptors for socket and for accepted socket
     struct sockaddr_in server, client; // structs for server (to initialize socket) and client
+
     char client_ip[INET_ADDRSTRLEN];
     int clientPort;
+
     pthread_mutex_t lock;
+
     int buffer_size;
     char *buffer;
 } newsock;
 
 void ListActiveListeners(newsock *socklist, int sockCnt);
-void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort, int EditIndex);
+void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t **thread_list, size_t *th_cnt, int EditPort, int EditIndex);
 void DeleteListener(newsock *socklist, int *sockCnt);
 void* listenerThread(void* sock);
-void EditListener(newsock *socklist, int *sockCnt, int *capacity);
+void EditListener(newsock **socklist, int *sockCnt, int *capacity);
 void AccessListener(newsock *socklist, int *sockCnt);
 
 
 int main(void){
 
-    int capacity = 32; // initial max number of listeners
+
+
+    int capacity = 2; // initial max number of listeners
     int sockCnt = 0;
+
+    pthread_t thread_list[capacity];
+    size_t th_cnt = 0;
 
     newsock *socklist = calloc(capacity, sizeof(newsock));
     int userInp;
@@ -69,12 +79,12 @@ int main(void){
                 break;
             case 2:
                 // edit existing listener
-                EditListener(socklist, &sockCnt, &capacity);
+                EditListener(&socklist, &sockCnt, &capacity);
                 // take inp to edit which one
                 break;
             case 3:
                 // create new listener
-                CreateListener(socklist, &sockCnt, &capacity, 0, -1);
+                CreateListener(&socklist, &sockCnt, &capacity, &thread_list, &th_cnt, 0, -1);
                 break;
             case 4:
                 // use a listener
@@ -98,24 +108,25 @@ int main(void){
 }    
 
 
-void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort, int EditIndex) {
+void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t **thread_list, size_t *th_cnt, int EditPort, int EditIndex) {
 
     newsock newSock;
 
     if(EditPort){
-        close(socklist[EditIndex].sockfd);
-        socklist[EditIndex].sockfd = -1; // Mark as inactive
-        newSock = socklist[EditIndex];
+        close((*socklist)[EditIndex].sockfd);
+        (*socklist)[EditIndex].sockfd = -1; // Mark as inactive
+        newSock = (*socklist)[EditIndex];
         goto PORT_CHANGE;
     }
     if (*sockCnt >= *capacity) {
         *capacity *= 2;
-        socklist = realloc(socklist, (*capacity) * sizeof(newsock));
-        if (!socklist) {
-            perror("Failed to allocate memory for new listener");
+        newsock *tmp = realloc(socklist, (*capacity) * sizeof(newsock));
+        if (!tmp) {
+            perror("Failed to reallocate memory for listener list");
             exit(EXIT_FAILURE);
         }
-    }
+        *socklist = tmp;
+    }   
     newSock.buffer_size = 1024;
     newSock.buffer = malloc(newSock.buffer_size);
         if (!newSock.buffer) {
@@ -161,13 +172,18 @@ void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort
          return;
      }
 
+     if(setsockopt(newSock.sockfd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) == -1){
+         printf("Setsockopt SO_REUSEADDR failed, errno is %d \n", errno);
+         return;
+     }
+
     if (bind(newSock.sockfd, (struct sockaddr*)&newSock.server, sizeof(newSock.server)) < 0) {
         perror("Bind failed");
         close(newSock.sockfd);
         return;
     }
 
-    if (listen(newSock.sockfd, 1) < 0) {
+    if (listen(newSock.sockfd, SOMAXCONN) < 0) {
         perror("Listen failed");
         close(newSock.sockfd);
         return;
@@ -175,16 +191,21 @@ void CreateListener(newsock *socklist, int *sockCnt, int *capacity, int EditPort
     }
 
     if(EditPort !=1){
-        socklist[*sockCnt] = newSock;
+        (*socklist)[*sockCnt] = newSock;
         (*sockCnt)++;
     }
     else{
-        socklist[EditIndex] = newSock;
+        (*socklist)[EditIndex] = newSock;
     }
 
     pthread_t thread_id;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED); // Set thread to detached state
 
     pthread_create(&thread_id, NULL, listenerThread, &newSock);
+    th_cnt++;
+    pthread_attr_destroy(&attr);
     printf("\033[32mListener %s created on port \033[0m%d\n", newSock.name, port);
 }
 
@@ -204,19 +225,20 @@ void* listenerThread(void* sock) {
 
         socklen_t len = sizeof(listener->client);
 
-        pthread_mutex_lock(&listener->lock);
 
         if((listener->connectfd = accept(listener->sockfd, (struct sockaddr*)&listener->client, &len)) >= 0){
-
+            
+            pthread_mutex_lock(&listener->lock);
             inet_ntop(AF_INET, &listener->client.sin_addr, listener->client_ip, sizeof(listener->client_ip));
             listener->clientPort = ntohs(listener->client.sin_port);
+            pthread_mutex_unlock(&listener->lock);
+
 
             printf("Accepted connection on listener %s\n", listener->name);
             printf("Client IP: %s, Client Port: %d\n", listener->client_ip, listener->clientPort);
         }
         if(listener->connectfd < 0){
             perror("Server accept failed");
-            pthread_mutex_unlock(&listener->lock);
             sleep(1); // sleep for 1s before retrying
             continue;
         }
@@ -228,19 +250,25 @@ void* listenerThread(void* sock) {
 
 
             if(total_len >= listener->buffer_size - 2) {
-                listener->buffer = realloc(listener->buffer, listener->buffer_size * 2);
-                listener->buffer_size *= 2;
-                if (!listener->buffer) {
-                    perror("Failed to allocate memory for buffer");
-                    pthread_mutex_unlock(&listener->lock);
-                    exit(EXIT_FAILURE);
+                char* tmp = realloc(listener->buffer, listener->buffer_size * 2);
+                if (!tmp) {
+                    perror("Failed to reallocate buffer, restarting listener");
+                    close(listener->connectfd);
+                    listener->connectfd = -1; // Reset connectfd to indicate no active connection
+                    total_len = 0;
+                    continue;
                 }
+                pthread_mutex_lock(&listener->lock);
+                listener->buffer = tmp;
+                listener->buffer_size *= 2;
+                
+                pthread_mutex_unlock(&listener->lock);
+
             }
             printf("Received data: %s\n", listener->buffer);
-            listener->buffer[n] = '\n'; // new line
-            listener->buffer[n + 1] = '\0'; // null terminator
+            listener->buffer[total_len] = '\n'; // new line
+            listener->buffer[total_len] = '\0'; // null terminator
         }
-        pthread_mutex_unlock(&listener->lock);
         sleep(1); // to let parent grab access to listener if needed
 
     }
@@ -287,10 +315,10 @@ void DeleteListener(newsock *socklist, int *sockCnt) {
     printf("\033[31mListener deleted successfully.\033[0m\n\n");
 }
 
-void EditListener(newsock *socklist, int *sockCnt, int *capacity){
+void EditListener(newsock **socklist, int *sockCnt, int *capacity){
 
     int inp;
-    ListActiveListeners(socklist, *sockCnt);
+    ListActiveListeners(*socklist, *sockCnt);
 
     printf("Enter number of listener you want to edit\n");
     scanf("%d", &inp);
@@ -299,13 +327,13 @@ void EditListener(newsock *socklist, int *sockCnt, int *capacity){
         printf("Invalid index. Returning to main menu.\n\n");
         return;
     }
-    else if( socklist[inp-1].sockfd == -1){
+    else if((*socklist)[inp-1].sockfd == -1){
         printf("Listener is inactive. Returning to main menu.\n\n");
         return;
     }
 
     int choice;
-    printf("Name: %s\nPort: %d\n\n", socklist[inp-1].name, ntohs(socklist[inp-1].server.sin_port));
+    printf("Name: %s\nPort: %d\n\n", (*socklist)[inp-1].name, ntohs((*socklist)[inp-1].server.sin_port));
     printf("What do you want to edit?\n1 for name\n2 for port (Editing port WILL close socket and open a new one)\n3 to exit\n");
     scanf("%d", &choice);
     getchar();
@@ -313,21 +341,21 @@ void EditListener(newsock *socklist, int *sockCnt, int *capacity){
     switch(choice){
         case 1:
             printf("Enter new name (max 15 characters): ");
-            if(fgets(socklist[inp].name, 15, stdin)){
-                size_t len = strlen(socklist[inp].name);
-                if (len > 0 && socklist[inp].name[len - 1] == '\n') {
-                    socklist[inp].name[len - 1] = '\0'; // Remove newline character
+            if(fgets((*socklist)[inp].name, 15, stdin)){
+                size_t len = strlen((*socklist)[inp].name);
+                if (len > 0 && (*socklist)[inp].name[len - 1] == '\n') {
+                    (*socklist)[inp].name[len - 1] = '\0'; // Remove newline character
                 }
             } else {
                 printf("Failed to read listener name.\n");
                 return;
             }
-            printf("Name changed successfully to %s\n", socklist[inp].name);
+            printf("Name changed successfully to %s\n", (*socklist)[inp].name);
             break;
 
         case 2:
             printf("Enter new port number: ");
-            CreateListener(socklist, sockCnt, capacity, 1, inp); // Create new listener on new port
+            CreateListener(socklist, sockCnt, capacity, NULL, NULL, 1, inp); // Create new listener on new port
             
             break;
 
@@ -361,18 +389,16 @@ void AccessListener(newsock *socklist, int *sockCnt){
     // Now you can use socklist[inp] to access the selected listener
     // For example, you might want to read messages from it or perform other operations
     printf("Accessing listener %s on port %d\n", socklist[inp].name, ntohs(socklist[inp].server.sin_port));
-    pthread_mutex_lock(&socklist[inp].lock);
     printf("Locked listener %s for exclusive access.\n", socklist[inp].name);
 
+    int choice;
     while(1) {
         printf("Type: \n0 to return to main menu\n1 to see client info\n2 to read messages\n3 to send message(still not developed)\n");
-        scanf("%d", &inp);
+        scanf("%d", &choice);
         getchar();
 
-        inp -= 1;
 
-        if(inp == -1){
-            pthread_mutex_unlock(&socklist[inp].lock);
+        if(choice == 0){
             break;
         }
         else if(inp == 0){
@@ -386,13 +412,11 @@ void AccessListener(newsock *socklist, int *sockCnt){
         }
         else{
             printf("Invalid option. Returning to main menu.\n");
-            pthread_mutex_unlock(&socklist[inp].lock);
         
         }
     }
 
 
-    pthread_mutex_unlock(&socklist[inp].lock);
     return;
 }
 
