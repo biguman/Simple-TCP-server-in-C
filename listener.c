@@ -28,25 +28,30 @@ typedef struct{
     char *buffer;
 } newsock;
 
+newsock *socklist = NULL; // dynamic array of listeners
+pthread_t *thread_list = NULL;
+
+
+pthread_mutex_t arr_lock = PTHREAD_MUTEX_INITIALIZER; // mutex for accessing/modifying socklist
+
 void ListActiveListeners(newsock *socklist, int sockCnt);
 void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t **thread_list, size_t *th_cnt, int EditPort, int EditIndex);
 void DeleteListener(newsock *socklist, int *sockCnt);
-void* listenerThread(void* sock);
+void* listenerThread(void* index);
 void EditListener(newsock **socklist, int *sockCnt, int *capacity);
 void AccessListener(newsock *socklist, int *sockCnt);
+void ExitListener(int *sockCnt);
 
 
 int main(void){
 
-
-
     int capacity = 2; // initial max number of listeners
     int sockCnt = 0;
 
-    pthread_t thread_list[capacity];
     size_t th_cnt = 0;
 
-    newsock *socklist = calloc(capacity, sizeof(newsock));
+    thread_list = malloc(capacity * sizeof(pthread_t));
+    socklist = calloc(capacity, sizeof(newsock));
     int userInp;
     int port;
     char *ip;
@@ -99,6 +104,7 @@ int main(void){
 
             case 9:
                 // close all listeners and exit process
+                ExitListener(&sockCnt);
                 return 0;
             default:
         }
@@ -120,12 +126,26 @@ void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t *
     }
     if (*sockCnt >= *capacity) {
         *capacity *= 2;
-        newsock *tmp = realloc(socklist, (*capacity) * sizeof(newsock));
+        
+        newsock *tmp = malloc((*capacity) * sizeof(newsock));
         if (!tmp) {
             perror("Failed to reallocate memory for listener list");
             exit(EXIT_FAILURE);
         }
+        memcpy(tmp, *socklist, (*sockCnt) * sizeof(newsock));
+        free(*socklist);
         *socklist = tmp;
+
+        tmp = NULL;
+        pthread_t *tmp_thread = malloc((*capacity) * sizeof(pthread_t));
+        if (!tmp_thread) {
+            perror("Failed to reallocate memory for thread list");
+            exit(EXIT_FAILURE);
+        }
+        memcpy(tmp_thread, *thread_list, (*th_cnt) * sizeof(pthread_t));
+        free(*thread_list);
+        *thread_list = tmp_thread;
+
     }   
     newSock.buffer_size = 1024;
     newSock.buffer = malloc(newSock.buffer_size);
@@ -203,77 +223,100 @@ void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t *
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED); // Set thread to detached state
 
-    pthread_create(&thread_id, NULL, listenerThread, &newSock);
-    th_cnt++;
+    int index = *th_cnt;
+    pthread_create(&thread_id, NULL, listenerThread, &index);
+    (*thread_list)[*th_cnt] = thread_id;
+    (*th_cnt)++;
     pthread_attr_destroy(&attr);
     printf("\033[32mListener %s created on port \033[0m%d\n", newSock.name, port);
 }
 
 
-void* listenerThread(void* sock) {
+void* listenerThread(void* index) {
 
     // pthread_mutexattr_t attr;
     // pthread_mutexattr_init(&attr);
     // pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_NONE); 
 
 
-    newsock *listener = (newsock*)sock;
+
+    newsock *listener = &(socklist[*(int*)index]);
+    int OG_fd = listener->sockfd;
 
     ssize_t n = 0;
     int total_len = 0;
+    socklen_t len = sizeof(listener->client);
+
     while (1) {
 
-        socklen_t len = sizeof(listener->client);
+        printf("Thread is reading from listener: %s on port: %d on FD: %d\n", listener->name, ntohs(listener->server.sin_port), listener->sockfd);
 
+        if(listener->sockfd != OG_fd){
+            listener = &(socklist[*(int*)index]);
+        }
 
         if((listener->connectfd = accept(listener->sockfd, (struct sockaddr*)&listener->client, &len)) >= 0){
+
+            if(listener->connectfd < 0){
+                perror("Server accept failed");
+                sleep(1); // sleep for 1s before retrying
+                continue;
+            }
             
             pthread_mutex_lock(&listener->lock);
-            inet_ntop(AF_INET, &listener->client.sin_addr, listener->client_ip, sizeof(listener->client_ip));
+            inet_ntop(AF_INET, &listener->client.sin_addr, listener->client_ip, sizeof(listener->client_ip)); // fill client_ip
             listener->clientPort = ntohs(listener->client.sin_port);
             pthread_mutex_unlock(&listener->lock);
 
 
             printf("Accepted connection on listener %s\n", listener->name);
             printf("Client IP: %s, Client Port: %d\n", listener->client_ip, listener->clientPort);
-        }
-        if(listener->connectfd < 0){
-            perror("Server accept failed");
-            sleep(1); // sleep for 1s before retrying
-            continue;
-        }
-        
 
-        n = read(listener->connectfd, listener->buffer + total_len, listener->buffer_size - total_len - 2);
-        if(n > 0){
-            total_len += n;
+            while(1){
+
+                n = read(listener->connectfd, listener->buffer + total_len, listener->buffer_size - total_len - 2);
+                if(n > 0){
+                total_len += n;
 
 
-            if(total_len >= listener->buffer_size - 2) {
-                char* tmp = realloc(listener->buffer, listener->buffer_size * 2);
-                if (!tmp) {
-                    perror("Failed to reallocate buffer, restarting listener");
-                    close(listener->connectfd);
-                    listener->connectfd = -1; // Reset connectfd to indicate no active connection
-                    total_len = 0;
-                    continue;
-                }
-                pthread_mutex_lock(&listener->lock);
-                listener->buffer = tmp;
-                listener->buffer_size *= 2;
+                if(total_len >= listener->buffer_size - 2) {
+                    char* tmp = malloc(listener->buffer_size * 2);
+                    if (!tmp) {
+                        perror("Failed to reallocate buffer, restarting listener");
+                        close(listener->connectfd);
+                        listener->connectfd = -1; // Reset connectfd to indicate no active connection
+                        total_len = 0;
+                        continue;
+                    }
+                    memcpy(tmp, listener->buffer, listener->buffer_size);
+                    pthread_mutex_lock(&listener->lock);
+
+                    free(listener->buffer);
+                    listener->buffer = tmp;
+                    listener->buffer_size *= 2;
                 
-                pthread_mutex_unlock(&listener->lock);
+                    pthread_mutex_unlock(&listener->lock);
+                    tmp = NULL;
+                    printf("Buffer resized to %d bytes\n", listener->buffer_size);
 
-            }
-            printf("Received data: %s\n", listener->buffer);
-            listener->buffer[total_len] = '\n'; // new line
-            listener->buffer[total_len] = '\0'; // null terminator
-        }
-        sleep(1); // to let parent grab access to listener if needed
+                }
+                printf("Received data: %s\n", listener->buffer);
+                listener->buffer[total_len] = '\n'; // new line
+                listener->buffer[total_len] = '\0'; // null terminator
+                sleep(1); // to let parent grab access to listener if needed
 
+                }
+            }//inner loop ends here
+
+        sleep(10); // to let parent grab access to listener if neede
+        } // Outer while loop ends here
+
+        sleep(10); // sleep for 1s before retrying
     }
     return NULL;
 }
+
+// newSock *
 
 void ListActiveListeners(newsock *socklist, int sockCnt) {
     printf("Active listeners:\n\n");
@@ -418,6 +461,22 @@ void AccessListener(newsock *socklist, int *sockCnt){
 
 
     return;
+}
+
+void ExitListener(int *sockCnt){
+    for(int i = 0; i < *sockCnt; i++){
+        if(socklist[i].sockfd != -1){
+            close(socklist[i].sockfd);
+            socklist[i].sockfd = -1;
+            
+        }
+        free(socklist[i].buffer);
+        pthread_cancel(thread_list[i]);
+    }
+    free(socklist);
+    *sockCnt = 0;
+    printf("All listeners closed. Exiting process.\n");
+    exit(0);
 }
 
 //  WHEN I WAS USING FORKS INSTEAD OF THREADS. INCOMPLETE FORK IMPLEMENTATION
