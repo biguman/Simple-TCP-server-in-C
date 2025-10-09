@@ -36,7 +36,7 @@ pthread_mutex_t arr_lock = PTHREAD_MUTEX_INITIALIZER; // mutex for accessing/mod
 
 void ListActiveListeners(newsock *socklist, int sockCnt);
 void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t **thread_list, size_t *th_cnt, int EditPort, int EditIndex);
-void DeleteListener(newsock *socklist, int *sockCnt);
+void DeleteListener(newsock *socklist, int *sockCnt, size_t *th_cnt);
 void* listenerThread(void* index);
 void EditListener(newsock **socklist, int *sockCnt, int *capacity);
 void AccessListener(newsock *socklist, int *sockCnt);
@@ -48,7 +48,7 @@ int main(void){
     int capacity = 2; // initial max number of listeners
     int sockCnt = 0;
 
-    size_t th_cnt = 0;
+    size_t th_cnt = 0; // number of threads
 
     thread_list = malloc(capacity * sizeof(pthread_t));
     socklist = calloc(capacity, sizeof(newsock));
@@ -98,7 +98,7 @@ int main(void){
 
             case 5:
                 //list listeners and take inp to delete which one
-                DeleteListener(socklist, &sockCnt);
+                DeleteListener(socklist, &sockCnt, &th_cnt);
 
                 break;
 
@@ -167,7 +167,7 @@ void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t *
 
     PORT_CHANGE:
     int port;
-    printf("\033[34mEnter port number for new listener: \033[0m");
+    printf("\033[94mEnter port number for new listener: \033[0m");
     if (scanf(" %d", &port) != 1 || port <= 0 || port > 65535) {
         getchar();
         printf("Invalid port number. Please enter a valid port (1-65535).\nEntered %d\n", port);
@@ -209,13 +209,16 @@ void CreateListener(newsock **socklist, int *sockCnt, int *capacity, pthread_t *
         return;
         
     }
+    printf("sock cnt is %d and capacity is %d\n\n", *sockCnt, *capacity);
 
     if(EditPort !=1){
         (*socklist)[*sockCnt] = newSock;
         (*sockCnt)++;
     }
     else{
+        pthread_mutex_lock(&(*socklist)[EditIndex].lock);
         (*socklist)[EditIndex] = newSock;
+        pthread_mutex_unlock(&(*socklist)[EditIndex].lock);
     }
 
     pthread_t thread_id;
@@ -248,6 +251,12 @@ void* listenerThread(void* index) {
     socklen_t len = sizeof(listener->client);
 
     while (1) {
+
+        if(listener->sockfd == -1){
+            printf("Listener %s is inactive. Exiting thread.\n", listener->name);
+            pthread_exit(NULL);
+            return NULL;
+        }
 
         printf("Thread is reading from listener: %s on port: %d on FD: %d\n", listener->name, ntohs(listener->server.sin_port), listener->sockfd);
 
@@ -329,7 +338,7 @@ void ListActiveListeners(newsock *socklist, int sockCnt) {
     }
 }
 
-void DeleteListener(newsock *socklist, int *sockCnt) {
+void DeleteListener(newsock *socklist, int *sockCnt, size_t *th_cnt) {
     int delIndex;
 
     ListActiveListeners(socklist, *sockCnt);
@@ -348,12 +357,18 @@ void DeleteListener(newsock *socklist, int *sockCnt) {
 
     close(socklist[delIndex].sockfd);
     socklist[delIndex].sockfd = -1; // Mark as inactive
+    free(socklist[delIndex].buffer);
+    // pthread_cancel(thread_list[delIndex]);
 
     // Optional: Shift remaining listeners down
     for (int i = delIndex; i < *sockCnt - 1; i++) {
         socklist[i] = socklist[i + 1];
     }
     (*sockCnt)--;
+    for (int i = delIndex; i < *sockCnt - 1; i++) {
+        thread_list[i] = thread_list[i + 1];
+    }
+    (*th_cnt)--;
 
     printf("\033[31mListener deleted successfully.\033[0m\n\n");
 }
